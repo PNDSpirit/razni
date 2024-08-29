@@ -1,0 +1,39 @@
+#!/bin/bash
+# Dependencies: tesseract-ocr imagemagick scrot xsel
+
+tesseract_lang=eng+bul
+# Use both English and Bulgarian with the best available models.
+
+SCR_IMG=`mktemp`
+trap "rm $SCR_IMG*" EXIT
+
+scrot -s $SCR_IMG.png -q 100
+# Increase image quality with option -q from default 75 to 100
+
+# Calculate the average brightness of the image
+average_brightness=$(convert $SCR_IMG.png -colorspace Gray -format "%[fx:mean]" info:)
+
+# Check if the image is predominantly dark
+if (( $(echo "$average_brightness < 0.5" | bc -l) )); then
+    # If the image is dark, invert it
+    convert $SCR_IMG.png -negate $SCR_IMG.png
+fi
+
+# Convert image to grayscale
+convert $SCR_IMG.png -colorspace Gray $SCR_IMG.png
+
+# Increase contrast and apply a static threshold
+convert $SCR_IMG.png -contrast-stretch 0x50% $SCR_IMG.png
+convert $SCR_IMG.png -threshold 50% $SCR_IMG.png
+
+# Despeckle to reduce noise
+convert $SCR_IMG.png -despeckle $SCR_IMG.png
+
+tesseract $SCR_IMG.png $SCR_IMG -l $tesseract_lang --oem 1 --psm 3 &> /dev/null
+# Use LSTM engine with automatic page segmentation and specified language models
+
+cat $SCR_IMG.txt | xsel -bi
+# Copy OCR result to clipboard
+
+exit
+
