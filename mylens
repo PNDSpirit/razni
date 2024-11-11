@@ -1,39 +1,217 @@
 #!/bin/bash
-# Dependencies: tesseract-ocr imagemagick scrot xsel
 
-tesseract_lang=eng+bul
-# Use both English and Bulgarian with the best available models.
+# ====================================================
+# Enhanced OCR Screenshot Script with Fixes
+# ====================================================
 
-SCR_IMG=`mktemp`
-trap "rm $SCR_IMG*" EXIT
+# Configuration
+OCR_LANG="eng+bul"               # Languages for Tesseract
+CLIPBOARD_TOOL="xsel"            # Clipboard tool: xsel, xclip, wl-copy
+NOTIFY_SUCCESS=true              # Enable success notifications
+NOTIFY_ERROR=true                # Enable error notifications
+TMP_PREFIX="ocr_screenshot_"     # Prefix for temporary files
+DEBUG=true                       # Enable debug mode
 
-scrot -s $SCR_IMG.png -q 100
-# Increase image quality with option -q from default 75 to 100
+# Set DISPLAY and XAUTHORITY
+export DISPLAY=${DISPLAY:-:0}
+export XAUTHORITY=${XAUTHORITY:-$HOME/.Xauthority}
 
-# Calculate the average brightness of the image
-average_brightness=$(convert $SCR_IMG.png -colorspace Gray -format "%[fx:mean]" info:)
+# Function to display error messages and exit
+error_exit() {
+    local msg="$1"
+    if [ "$NOTIFY_ERROR" = true ]; then
+        notify-send "OCR Screenshot Error" "$msg" --icon=dialog-error
+    else
+        echo "Error: $msg" >&2
+    fi
+    exit 1
+}
 
-# Check if the image is predominantly dark
-if (( $(echo "$average_brightness < 0.5" | bc -l) )); then
-    # If the image is dark, invert it
-    convert $SCR_IMG.png -negate $SCR_IMG.png
-fi
+# Function to send success notifications
+send_notification() {
+    if [ "$NOTIFY_SUCCESS" = true ]; then
+        notify-send "OCR Screenshot" "Text copied to clipboard." --icon=dialog-information
+    fi
+}
 
-# Convert image to grayscale
-convert $SCR_IMG.png -colorspace Gray $SCR_IMG.png
+# Function to log debug messages
+log_debug() {
+    if [ "$DEBUG" = true ]; then
+        echo "[DEBUG] $1"
+    fi
+}
 
-# Increase contrast and apply a static threshold
-convert $SCR_IMG.png -contrast-stretch 0x50% $SCR_IMG.png
-convert $SCR_IMG.png -threshold 50% $SCR_IMG.png
+# Function to check if a command exists
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
 
-# Despeckle to reduce noise
-convert $SCR_IMG.png -despeckle $SCR_IMG.png
+# Function to determine the clipboard tool
+determine_clipboard_tool() {
+    if [ "$CLIPBOARD_TOOL" = "auto" ]; then
+        if command_exists wl-copy; then
+            CLIPBOARD_TOOL="wl-copy"
+        elif command_exists xclip; then
+            CLIPBOARD_TOOL="xclip"
+        elif command_exists xsel; then
+            CLIPBOARD_TOOL="xsel"
+        else
+            error_exit "No clipboard tool found. Install wl-copy, xclip, or xsel."
+        fi
+    else
+        if ! command_exists "$CLIPBOARD_TOOL"; then
+            error_exit "Specified clipboard tool '$CLIPBOARD_TOOL' is not installed."
+        fi
+    fi
+}
 
-tesseract $SCR_IMG.png $SCR_IMG -l $tesseract_lang --oem 1 --psm 3 &> /dev/null
-# Use LSTM engine with automatic page segmentation and specified language models
+# Function to check all dependencies
+check_dependencies() {
+    log_debug "Checking dependencies..."
 
-cat $SCR_IMG.txt | xsel -bi
-# Copy OCR result to clipboard
+    # Check for screenshot tool
+    if command_exists scrot; then
+        SCREENSHOT_TOOL="scrot"
+    elif command_exists grim && command_exists slurp; then
+        SCREENSHOT_TOOL="grim"
+    else
+        error_exit "No screenshot tool found. Install scrot for X11 or grim & slurp for Wayland."
+    fi
 
-exit
+    # Check for ImageMagick
+    if ! command_exists convert; then
+        error_exit "ImageMagick is not installed. Install it with your package manager."
+    fi
 
+    # Check for Tesseract
+    if ! command_exists tesseract; then
+        error_exit "Tesseract OCR is not installed. Install it with your package manager."
+    fi
+
+    # Check for clipboard tool
+    determine_clipboard_tool
+
+    # Check for notify-send
+    if [ "$NOTIFY_SUCCESS" = true ] || [ "$NOTIFY_ERROR" = true ]; then
+        if ! command_exists notify-send; then
+            echo "Warning: notify-send not found. Notifications will be disabled."
+            NOTIFY_SUCCESS=false
+            NOTIFY_ERROR=false
+        fi
+    fi
+
+    log_debug "All dependencies are satisfied."
+}
+
+# Function to take a screenshot
+take_screenshot() {
+    TMP_IMG=$(mktemp --suffix=.png /tmp/${TMP_PREFIX}XXXXXX) || error_exit "Failed to create temporary image file."
+    log_debug "Temporary image file path: $TMP_IMG"
+
+    if [ "$SCREENSHOT_TOOL" = "scrot" ]; then
+        log_debug "Using scrot to take screenshot."
+        # Remove the temporary file if it exists
+        rm -f "$TMP_IMG"
+        # Use '--' to ensure scrot treats the filename literally
+        xdotool mousemove_relative 0 0
+        sleep 0.3
+        scrot -s -q 100 -- "$TMP_IMG" 2> /tmp/scrot_error.log
+        SCROT_EXIT_STATUS=$?
+        if [ $SCROT_EXIT_STATUS -ne 0 ]; then
+            SCROT_ERROR_MSG=$(cat /tmp/scrot_error.log)
+            error_exit "Failed to take screenshot with scrot. Error: $SCROT_ERROR_MSG"
+        fi
+    elif [ "$SCREENSHOT_TOOL" = "grim" ]; then
+        log_debug "Using grim and slurp to take screenshot."
+        SLURP_AREA=$(slurp 2> /tmp/slurp_error.log) || { rm -f "$TMP_IMG"; error_exit "Failed to select area with slurp. Check /tmp/slurp_error.log for details."; }
+        grim -g "$SLURP_AREA" "$TMP_IMG" 2> /tmp/grim_error.log || { rm -f "$TMP_IMG"; error_exit "Failed to take screenshot with grim. Check /tmp/grim_error.log for details."; }
+    fi
+
+    # Verify that the screenshot was taken successfully
+    if [ ! -s "$TMP_IMG" ]; then
+        error_exit "Screenshot file is empty or invalid."
+    fi
+
+    log_debug "Screenshot captured successfully at $TMP_IMG."
+}
+
+# Function to process the image for OCR
+process_image() {
+    log_debug "Processing image for OCR..."
+
+    # Increase image size to improve OCR accuracy
+    convert "$TMP_IMG" -resize 300% "$TMP_IMG"
+
+    # Convert to grayscale
+    convert "$TMP_IMG" -colorspace Gray "$TMP_IMG"
+
+    # Apply adaptive thresholding
+    convert "$TMP_IMG" -adaptive-threshold 8x8+16% "$TMP_IMG"
+
+    log_debug "Image processing completed with resizing and adaptive thresholding."
+}
+
+
+# Function to perform OCR
+perform_ocr() {
+    log_debug "Performing OCR on the image..."
+
+    OCR_OUTPUT=$(mktemp /tmp/${TMP_PREFIX}XXXX.txt) || error_exit "Failed to create temporary OCR output file."
+
+    # Try different psm modes
+    tesseract "$TMP_IMG" "${OCR_OUTPUT%.txt}" -l "$OCR_LANG" --oem 1 --psm 6 >/dev/null 2>&1 || { rm -f "$TMP_IMG" "$OCR_OUTPUT"; error_exit "Tesseract OCR failed."; }
+
+    # Read the OCR result
+    OCR_TEXT=$(cat "${OCR_OUTPUT}") || { rm -f "$TMP_IMG" "$OCR_OUTPUT"; error_exit "Failed to read OCR output."; }
+
+    # Optional: Post-processing corrections
+    OCR_TEXT=$(echo "$OCR_TEXT" | sed 's/medel/model/g; s/4o/4.0/g')
+
+    log_debug "OCR completed successfully."
+}
+
+# Function to copy text to clipboard
+copy_to_clipboard() {
+    log_debug "Copying text to clipboard using $CLIPBOARD_TOOL..."
+
+    case "$CLIPBOARD_TOOL" in
+        wl-copy)
+            echo "$OCR_TEXT" | wl-copy || error_exit "Failed to copy text to clipboard with wl-copy."
+            ;;
+        xclip)
+            echo "$OCR_TEXT" | xclip -selection clipboard || error_exit "Failed to copy text to clipboard with xclip."
+            ;;
+        xsel)
+            echo "$OCR_TEXT" | xsel --clipboard --input || error_exit "Failed to copy text to clipboard with xsel."
+            ;;
+        *)
+            error_exit "Unsupported clipboard tool: $CLIPBOARD_TOOL"
+            ;;
+    esac
+
+    log_debug "Text copied to clipboard successfully."
+}
+
+# Function to clean up temporary files
+cleanup() {
+    log_debug "Cleaning up temporary files..."
+    rm -f "$TMP_IMG" /tmp/scrot_error.log /tmp/slurp_error.log /tmp/grim_error.log "$OCR_OUTPUT"
+}
+
+# Main Function
+main() {
+    check_dependencies
+    take_screenshot
+    process_image
+    perform_ocr
+    copy_to_clipboard
+    send_notification
+}
+
+# Execute the main function
+main
+
+# Ensure cleanup happens on script exit
+trap cleanup EXIT
+
+exit 0
